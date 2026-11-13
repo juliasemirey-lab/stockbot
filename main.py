@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-import yaml
+import simpleyaml as yaml   # свой разборщик: работает без PyYAML
 
 from calc import build_lines, group_by_supplier, pair_separates          # noqa: E402
 from pipeline import build_rows_from_dump, build_rows_from_ms           # noqa: E402
@@ -174,13 +174,6 @@ def cmd_order(args):
     print("\nДокументы не проведены — проверьте и проведите в МойСклад.")
 
 
-def cmd_doctor(args):
-    """Показывает по каждому источнику, сколько записей пришло и где ошибка."""
-    import diagnose
-    cfg = load_cfg(args.config)
-    sys.exit(diagnose.run(cfg))
-
-
 def cmd_run(args):
     from aiogram import Bot
     from aiogram.client.default import DefaultBotProperties
@@ -243,9 +236,6 @@ def main():
     c.add_argument("--dry", action="store_true", help="показать, но не создавать")
     c.add_argument("--dump", help="JSON-выгрузка вместо API")
     c.set_defaults(func=cmd_order)
-
-    doc = sub.add_parser("doctor", help="диагностика: что реально вернул МойСклад")
-    doc.set_defaults(func=cmd_doctor)
 
     r = sub.add_parser("run", help="бот + планировщик (нужен сервер 24/7)")
     r.set_defaults(func=cmd_run)

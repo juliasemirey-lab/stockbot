@@ -1,0 +1,50 @@
+name: create-order
+
+# Создание черновиков заказов поставщикам — вручную, кнопкой.
+# Нужно, чтобы не держать Python на своём компьютере вовсе.
+on:
+  workflow_dispatch:
+    inputs:
+      supplier:
+        description: "Часть имени поставщика или all"
+        required: true
+        default: "all"
+      dry:
+        description: "Только показать, не создавать (yes/no)"
+        required: true
+        default: "yes"
+
+jobs:
+  order:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Зависимости
+        run: pip install -q -r requirements.txt
+
+      - name: Кэш индекса баркодов WB
+        uses: actions/cache@v4
+        with:
+          path: .wb_barcode_index.json
+          key: wb-index-${{ github.run_id }}
+          restore-keys: wb-index-
+
+      - name: Заказ
+        env:
+          MOYSKLAD_TOKEN: ${{ secrets.MOYSKLAD_TOKEN }}
+          WB_CACHE_PATH: .wb_barcode_index.json
+        run: |
+          ARGS="${{ github.event.inputs.supplier }}"
+          if [ "${{ github.event.inputs.dry }}" = "yes" ]; then
+            python main.py order $ARGS --dry
+          else
+            python main.py order $ARGS
+          fi
