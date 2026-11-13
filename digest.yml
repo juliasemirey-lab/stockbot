@@ -1,0 +1,55 @@
+name: weekly-digest
+
+# Среда 07:00 UTC = 10:00 МСК (сейчас Москва UTC+3, перехода на летнее время нет).
+#
+# ВАЖНО: GitHub запускает cron только для workflow в ветке по умолчанию.
+# Плановые запуски в ПРИВАТНОМ репозитории на бесплатном плане не работают —
+# репозиторий должен быть ПУБЛИЧНЫМ либо нужен GitHub Pro.
+on:
+  schedule:
+    - cron: "0 7 * * 3"
+  workflow_dispatch:          # ручной запуск кнопкой — для отладки
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Зависимости
+        run: pip install -q -r requirements.txt
+
+      - name: Кэш индекса баркодов WB
+        # Полная выгрузка карточек WB — десятки запросов с лимитами.
+        # Кэш между запусками экономит время и не упирается в 429.
+        uses: actions/cache@v4
+        with:
+          path: .wb_barcode_index.json
+          key: wb-index-${{ github.run_id }}
+          restore-keys: wb-index-
+
+      - name: Отправить дайджест
+        env:
+          MOYSKLAD_TOKEN: ${{ secrets.MOYSKLAD_TOKEN }}
+          WB_TOKEN: ${{ secrets.WB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+          # кэш в рабочей папке, чтобы actions/cache его подхватил
+          WB_CACHE_PATH: .wb_barcode_index.json
+        run: python main.py once
+
+      - name: Сохранить CSV как артефакт
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-csv
+          path: digest_*.csv
+          if-no-files-found: ignore
+          retention-days: 30
