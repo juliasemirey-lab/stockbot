@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-import simpleyaml as yaml   # свой разборщик: работает без PyYAML
+import yaml
 
 from calc import build_lines, group_by_supplier, pair_separates          # noqa: E402
 from pipeline import build_rows_from_dump, build_rows_from_ms           # noqa: E402
