@@ -83,10 +83,14 @@ def build_rows_from_ms(ms: MS, cfg: dict, with_links: bool = True) -> list[dict]
     stock = ms.stock(store)                       # только нужный склад
     shipped = ms.shipped(window, store)
     returns = ms.returns(window)
-        try:
-            reserve_acc = ms.reserve_from_orders(store)
-        except Exception:
-            reserve_acc = {}
+    # Резерв уже приходит в отчёте об остатках. Заказы покупателей — только
+    # запасной источник, и запрашиваем их лишь если резерва нет ни у одной
+    # позиции: на части конфигураций МойСклад отвечает на этот запрос 412
+    # («Неверный параметр фильтрации»), и расчёт падал целиком.
+    if any((st.get("reserve") or 0) > 0 for st in stock.values()):
+        reserve_acc: dict[str, float] = {}
+    else:
+        reserve_acc = ms.reserve_from_orders(store)
     arrivals_by_sku, first_receipt = ms.arrivals_with_eta(now, store)
     supplier_by_sku = ms.supplier_map(sup_attr)
     wb_index = _wb_index(cfg) if with_links else {}
