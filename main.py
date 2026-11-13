@@ -15,9 +15,9 @@ import sys
 from datetime import date
 from pathlib import Path
 
-import yaml
-
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+import simpleyaml as yaml   # свой разборщик: работает без PyYAML
 
 from calc import build_lines, group_by_supplier, pair_separates          # noqa: E402
 from pipeline import build_rows_from_dump, build_rows_from_ms           # noqa: E402
@@ -72,7 +72,7 @@ def cmd_dry(args):
     if args.dump:
         cfg["_dump"] = args.dump
     lines, today, warns = collect(cfg, with_links=args.wb)
-    parts = [render_summary(lines, today, warns, top_n=int(cfg.get("top_n_in_chat", 8)))]
+    parts = [render_summary(lines, today, warns, cfg=cfg, top_n=int(cfg.get("top_n_in_chat", 10)))]
     parts += render_suppliers(lines, cfg)
     print(("\n\n" + "─" * 40 + "\n\n").join(parts))
     if args.csv:
@@ -101,7 +101,7 @@ def cmd_once(args):
 
     lines, today, warns = collect(cfg)
     action = [ln for ln in lines if ln.need > 0]
-    summary = render_summary(lines, today, warns, top_n=int(cfg.get("top_n_in_chat", 8)))
+    summary = render_summary(lines, today, warns, cfg=cfg, top_n=int(cfg.get("top_n_in_chat", 10)))
     supplier_msgs = render_suppliers(lines, cfg)
 
     csv_path = Path(f"digest_{today:%Y%m%d}.csv")
@@ -174,6 +174,13 @@ def cmd_order(args):
     print("\nДокументы не проведены — проверьте и проведите в МойСклад.")
 
 
+def cmd_doctor(args):
+    """Показывает по каждому источнику, сколько записей пришло и где ошибка."""
+    import diagnose
+    cfg = load_cfg(args.config)
+    sys.exit(diagnose.run(cfg))
+
+
 def cmd_run(args):
     from aiogram import Bot
     from aiogram.client.default import DefaultBotProperties
@@ -236,6 +243,9 @@ def main():
     c.add_argument("--dry", action="store_true", help="показать, но не создавать")
     c.add_argument("--dump", help="JSON-выгрузка вместо API")
     c.set_defaults(func=cmd_order)
+
+    doc = sub.add_parser("doctor", help="диагностика: что реально вернул МойСклад")
+    doc.set_defaults(func=cmd_doctor)
 
     r = sub.add_parser("run", help="бот + планировщик (нужен сервер 24/7)")
     r.set_defaults(func=cmd_run)
