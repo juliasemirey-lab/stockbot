@@ -25,6 +25,8 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 from calc import build, to_order                                    # noqa: E402
 from render import csv_bytes, digest                               # noqa: E402
 
+VERSION = "3.0"
+
 log = logging.getLogger("stockbot")
 
 
@@ -93,6 +95,9 @@ def cmd_sources(args):
         print(f"  {name}")
         print(f"      {result}\n")
 
+    print("Если у документов «с позициями» = 0 — раскрытие не работает,")
+    print("и продажи берутся поштучной догрузкой (медленно).\n")
+
     store_id = ms.resolve_store(cfg["warehouse"])
     stock = ms.stock(store_id)
     print(f"Остаток на складе «{cfg['warehouse']}»: {len(stock)} позиций")
@@ -140,6 +145,19 @@ def cmd_once(args):
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+
+    # Отпечаток кода: по нему видно, какая версия реально запущена.
+    # Если в логе нет строки «ВЕРСИЯ 3.0» — значит на GitHub старые файлы.
+    import hashlib
+    here = Path(__file__).parent
+    print("=" * 60)
+    print(f"  ВЕРСИЯ {VERSION}")
+    for name in ("main.py", "src/ms.py", "src/calc.py"):
+        f = here / name
+        if f.exists():
+            h = hashlib.md5(f.read_bytes()).hexdigest()[:10]
+            print(f"  {name:14} {h}")
+    print("=" * 60)
     p = argparse.ArgumentParser(description="Дайджест пополнения склада")
     p.add_argument("--config", default="config.yaml")
     sub = p.add_subparsers(dest="cmd", required=True)

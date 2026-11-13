@@ -222,42 +222,51 @@ class MS:
         return self.sales_from_docs(days)
 
     # --- 1. отчёт ---------------------------------------------------------
-    def _sales_from_report(self, days: int) -> dict[str, float]:
-        """Отчёт по оборотам. Пробуем оба варианта имён параметров дат."""
-        stamps = _period(days)
+    def _sales_from_report(self, days: int, loud: bool = False) -> dict[str, float]:
+        """Отчёт по оборотам. Перебираем варианты имён параметров дат.
+
+        Документация МойСклад не фиксирует набор параметров отчёта
+        об оборотах однозначно, а на разных тарифах он отвечает
+        по-разному, поэтому пробуем все известные написания.
+        """
+        since, until = _period(days)
         variants = [
-            ("/report/turnover/all", {"groupBy": "product"},
-             {"momentFrom": stamps[0], "momentTo": stamps[1]}),
-            ("/report/turnover/all", {"groupBy": "product"},
-             {"dateFrom": stamps[0], "dateTo": stamps[1]}),
-            ("/report/turnover/all", {},
-             {"momentFrom": stamps[0], "momentTo": stamps[1]}),
+            {"dateFrom": since, "dateTo": until},
+            {"momentFrom": since, "momentTo": until},
+            {},
         ]
 
-        for path, extra, dates in variants:
-            params = {**dates, **extra}
-            try:
-                out: dict[str, float] = {}
-                for r in self.rows(path, params, page=100):
-                    aid = (r.get("assortment") or {}).get("id")
-                    if not aid:
-                        continue
-                    qty = _quantity(r)
-                    if qty:
-                        out[aid] = out.get(aid, 0.0) + qty
-            except MoySkladError as e:
-                log.info("Отчёт %s %s: %s", path, list(dates)[0], e)
-                continue
+        for dates in variants:
+            label = next(iter(dates), "без дат")
+            for extra in ({"groupBy": "product"}, {}):
+                params = {**dates, **extra}
+                try:
+                    out: dict[str, float] = {}
+                    for r in self.rows("/report/turnover/all", params, page=100):
+                        aid = (r.get("assortment") or {}).get("id")
+                        if not aid:
+                            continue
+                        qty = _quantity(r)
+                        if qty:
+                            out[aid] = out.get(aid, 0.0) + qty
+                except MoySkladError as e:
+                    if loud:
+                        log.info("  обороты [%s%s]: %s", label,
+                                 " +groupBy" if extra else "", e)
+                    continue
 
-            if out:
-                log.info("Продажи из отчёта %s: %s позиций за %s дн.",
-                         path, len(out), days)
-                return out
+                if out:
+                    log.info("Продажи из отчёта об оборотах: %s позиций за %s дн.",
+                             len(out), days)
+                    return out
+                if loud:
+                    log.info("  обороты [%s%s]: пусто", label,
+                             " +groupBy" if extra else "")
 
-        log.info("Отчёт по оборотам пуст — идём в документы")
+        log.info("Отчёт об оборотах пуст — считаем по документам отгрузки")
         return {}
 
-    # --- 2. документы с раскрытыми позициями ------------------------------
+    # --- 2. документы с раскрытыми позициями    # --- 2. документы с раскрытыми позициями ------------------------------
     def _sales_inline(self, days: int) -> dict[str, float]:
         """Документы отгрузки с позициями прямо в ответе.
 
@@ -364,52 +373,56 @@ class MS:
         return result
 
     def probe(self, days: int = 28) -> list[tuple[str, str]]:
-        """Что реально вернул каждый источник продаж.
-
-        По документам отгрузки смотрим только первые 20 — этого хватает,
-        чтобы понять, приходят ли позиции, и не ждать минуту.
-        """
-        until = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
-            "%Y-%m-%d %H:%M:%S")
+        """Что реально вернул каждый источник. Для документов — первая сотня."""
+        since, until = _period(days)
         report: list[tuple[str, str]] = []
 
-        # 1. Отчёты — быстрый путь, но на части тарифов пусты
-        for path, extra in (
-            ("/report/turnover/all", {"groupBy": "product"}),
-            ("/report/turnover/byoperations", {}),
+        # отчёты: все варианты параметров
+        for label, dates in (
+            ("dateFrom/dateTo", {"dateFrom": since, "dateTo": until}),
+            ("momentFrom/momentTo", {"momentFrom": since, "momentTo": until}),
+            ("без дат", {}),
         ):
-            params = {"momentFrom": since, "momentTo": until, **extra}
-            try:
-                rows = list(self.rows(path, params, page=100))
-            except MoySkladError as e:
-                report.append((path, f"ошибка: {e}"))
-                continue
-            if not rows:
-                report.append((path, "ответил пусто"))
-                continue
-            qty = sum(_quantity(r) for r in rows)
-            keys = ", ".join(list(rows[0])[:8])
-            report.append((path, f"{len(rows)} строк, штук {qty:.0f} | поля: {keys}"))
+            for gb in ({"groupBy": "product"}, {}):
+                tag = label + (" +groupBy" if gb else "")
+                try:
+                    rows = list(self.rows("/report/turnover/all",
+                                          {**dates, **gb}, page=100))
+                except MoySkladError as e:
+                    report.append((f"обороты {tag}", f"ошибка: {e}"))
+                    continue
+                if not rows:
+                    report.append((f"обороты {tag}", "пусто"))
+                    continue
+                qty = sum(_quantity(r) for r in rows)
+                keys = ", ".join(list(rows[0])[:9])
+                report.append((f"обороты {tag}",
+                               f"{len(rows)} строк, штук {qty:.0f} | поля: {keys}"))
 
-        # 2. Документы отгрузки — основной путь
+        # документы: раскрываются ли позиции при limit=100
         for path in ("/entity/demand", "/entity/retaildemand"):
             try:
-                docs = list(self.rows(path, {"filter": f"moment>={since}"}))
+                docs = list(self.rows(path,
+                                      {"filter": f"moment>={since}",
+                                       "expand": "positions.assortment"},
+                                      page=100))
             except MoySkladError as e:
                 report.append((path, f"ошибка: {e}"))
                 continue
             if not docs:
                 report.append((path, "документов за период нет"))
                 continue
-
-            sample = docs[:20]
-            positions = self._positions_many(sample)
-            with_pos = sum(1 for i in range(len(sample)) if positions.get(i))
-            qty = sum(float(p.get("quantity") or 0)
-                      for rows in positions.values() for p in rows)
-            report.append((path, f"{len(docs)} док. | из первых {len(sample)} "
-                                 f"с позициями {with_pos}, штук {qty:.0f}"))
+            with_rows = sum(1 for d in docs
+                            if isinstance(d.get("positions"), dict)
+                            and d["positions"].get("rows"))
+            qty = 0.0
+            for d in docs:
+                pos = d.get("positions")
+                if isinstance(pos, dict):
+                    qty += sum(float(p.get("quantity") or 0)
+                               for p in pos.get("rows") or [])
+            report.append((path, f"документов в первой сотне: {len(docs)} | "
+                                 f"с позициями: {with_rows} | штук {qty:.0f}"))
 
         return report
 
