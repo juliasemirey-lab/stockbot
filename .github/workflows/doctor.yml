@@ -1,0 +1,27 @@
+name: doctor
+
+# Диагностика: показывает, сколько записей вернул каждый источник МойСклад.
+# Запускать, когда дайджест приходит пустым или цифры выглядят странно.
+on:
+  workflow_dispatch:
+
+jobs:
+  doctor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Зависимости
+        run: pip install -q -r requirements.txt
+
+      - name: Диагностика
+        env:
+          MOYSKLAD_TOKEN: ${{ secrets.MOYSKLAD_TOKEN }}
+        run: python main.py doctor
