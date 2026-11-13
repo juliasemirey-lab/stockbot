@@ -210,7 +210,7 @@ class MS:
                         st = (o.get("store") or {}).get("name", "")
                         if st and st.lower() != store_name.lower():
                             continue
-                    for p in (o.get("positions") or {}).get("rows", []):
+                    for p in self._doc_positions(o):
                         aid = (p.get("assortment") or {}).get("id")
                         if aid:
                             out[aid] = out.get(aid, 0.0) + float(p.get("quantity") or 0)
@@ -229,24 +229,98 @@ class MS:
     def _since(self, days: int) -> str:
         return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
+    def _doc_positions(self, doc: dict) -> list[dict]:
+        """Позиции документа.
+
+        В списке документов `positions` приходит либо готовым блоком с rows,
+        либо только ссылкой meta.href — во втором случае подгружаем отдельно.
+        Именно из-за этого отгрузки раньше считались нулевыми: документы
+        есть, а позиции не разобраны.
+        """
+        pos = doc.get("positions")
+        if isinstance(pos, dict):
+            rows = pos.get("rows")
+            if isinstance(rows, list) and rows:
+                return rows
+            href = (pos.get("meta") or {}).get("href", "")
+            if href:
+                path = href.split("/api/remap/1.2", 1)[-1]
+                try:
+                    return list(self.rows(path, params={"expand": "assortment"}))
+                except MoySkladError as e:
+                    log.warning("Не удалось получить позиции %s: %s", path, e)
+        return []
+
+    def shipped_raw(self, days: int = 28) -> list[tuple[str, dict]]:
+        """Документы отгрузок за период: список (тип, документ)."""
+        since = self._since(days)
+        variants = [
+            {"filter": f"moment>={since}", "expand": "positions.assortment,store"},
+            {"filter": f"moment>={since}", "expand": "positions,store"},
+            {"filter": f"moment>={since}"},
+        ]
+        last_error = None
+        for params in variants:
+            docs: list[tuple[str, dict]] = []
+            got_answer = False
+            for path in ("/entity/demand", "/entity/retaildemand"):
+                try:
+                    for d in self.rows(path, params=params):
+                        docs.append((path.rsplit("/", 1)[-1], d))
+                    got_answer = True
+                except MoySkladError as e:
+                    last_error = e
+            if got_answer:
+                with_pos = sum(1 for _, d in docs if self._has_positions(d))
+                log.info("Отгрузки: документов %s, с позициями %s",
+                         len(docs), with_pos)
+                return docs
+        raise MoySkladError(
+            f"Не удалось получить отгрузки за {days} дн. — расчёт невозможен. "
+            f"Последняя ошибка: {last_error}")
+
+    @staticmethod
+    def _has_positions(doc: dict) -> bool:
+        pos = doc.get("positions")
+        if not isinstance(pos, dict):
+            return False
+        rows = pos.get("rows")
+        return isinstance(rows, list) and len(rows) > 0
+
     def shipped(self, days: int = 28, store_name: str | None = None) -> dict[str, float]:
+        """Чистые отгрузки в штуках: assortmentId -> количество."""
+        docs = self.shipped_raw(days)
+        matched_store = 0
+        no_positions = 0
         out: dict[str, float] = {}
-        filt = f"moment>={self._since(days)}"
-        for path in ("/entity/demand", "/entity/retaildemand"):
-            try:
-                for d in self.rows(path, params={"filter": filt,
-                                                 "expand": "positions.assortment,store"}):
-                    if store_name:
-                        st = (d.get("store") or {}).get("name", "")
-                        if st and st.lower() != store_name.lower():
-                            continue
-                    for p in (d.get("positions") or {}).get("rows", []):
-                        aid = (p.get("assortment") or {}).get("id")
-                        if aid:
-                            q = float(p.get("quantity") or 0) - float(p.get("returnedQuantity") or 0)
-                            out[aid] = out.get(aid, 0.0) + q
-            except MoySkladError:
+
+        for kind, d in docs:
+            if store_name:
+                st = (d.get("store") or {}).get("name", "")
+                # если склад в документе не раскрыт — не отбрасываем документ
+                if st and st.lower() != store_name.lower():
+                    continue
+                matched_store += 1
+
+            positions = self._doc_positions(d)
+            if not positions:
+                no_positions += 1
                 continue
+
+            for p in positions:
+                aid = (p.get("assortment") or {}).get("id")
+                if not aid:
+                    continue
+                q = float(p.get("quantity") or 0) - float(p.get("returnedQuantity") or 0)
+                out[aid] = out.get(aid, 0.0) + q
+
+        if docs and store_name and matched_store == 0:
+            stores = sorted({(d.get("store") or {}).get("name", "—") for _, d in docs})
+            log.warning("Отгрузки есть (%s док.), но ни одна не на складе %r. "
+                        "Склады в отгрузках: %s", len(docs), store_name, ", ".join(stores))
+        if no_positions:
+            log.warning("В %s документах не удалось прочитать позиции", no_positions)
+
         return out
 
     def returns(self, days: int = 28) -> dict[str, float]:
@@ -256,7 +330,7 @@ class MS:
             try:
                 for d in self.rows(path, params={"filter": filt,
                                                  "expand": "positions.assortment"}):
-                    for p in (d.get("positions") or {}).get("rows", []):
+                    for p in self._doc_positions(d):
                         aid = (p.get("assortment") or {}).get("id")
                         if aid:
                             out[aid] = out.get(aid, 0.0) + float(p.get("quantity") or 0)
@@ -279,14 +353,14 @@ class MS:
                 moment = _parse_dt(s.get("moment"))
                 if s.get("applicable"):
                     if moment:
-                        for p in (s.get("positions") or {}).get("rows", []):
+                        for p in self._doc_positions(s):
                             aid = (p.get("assortment") or {}).get("id")
                             if aid and (aid not in first_receipt or moment < first_receipt[aid]):
                                 first_receipt[aid] = moment
                     continue
                 planned = _parse_dt(s.get("plannedMoment")) or moment
                 eta = max(0, (planned - now).days) if planned else 0
-                for p in (s.get("positions") or {}).get("rows", []):
+                for p in self._doc_positions(s):
                     aid = (p.get("assortment") or {}).get("id")
                     qty = float(p.get("quantity") or 0)
                     if aid and qty > 0:
@@ -305,7 +379,7 @@ class MS:
                         continue
                 planned = _parse_dt(o.get("deliveryPlannedMoment") or o.get("moment"))
                 eta = max(0, (planned - now).days) if planned else 0
-                for p in (o.get("positions") or {}).get("rows", []):
+                for p in self._doc_positions(o):
                     aid = (p.get("assortment") or {}).get("id")
                     qty = float(p.get("quantity") or 0) - float(p.get("shipped") or 0)
                     if aid and qty > 0:
@@ -341,7 +415,7 @@ class MS:
                     name, aid_ = agent.get("name", ""), agent.get("id", "")
                     if not name:
                         continue
-                    for p in (d.get("positions") or {}).get("rows", []):
+                    for p in self._doc_positions(d):
                         sku = (p.get("assortment") or {}).get("id")
                         if sku and sku not in out:
                             out[sku] = (name, aid_)
