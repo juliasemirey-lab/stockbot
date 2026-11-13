@@ -44,11 +44,12 @@ class MS:
             },
         )
 
-    def rows(self, path: str, params: dict | None = None) -> Iterator[dict]:
+    def rows(self, path: str, params: dict | None = None,
+             page: int = PAGE) -> Iterator[dict]:
         params = dict(params or {})
         offset = 0
         while True:
-            q = {**params, "limit": PAGE, "offset": offset}
+            q = {**params, "limit": page, "offset": offset}
             r = None
             for attempt in range(5):
                 try:
@@ -81,9 +82,9 @@ class MS:
             data = r.json()
             chunk = data.get("rows") or []
             yield from chunk
-            offset += PAGE
+            offset += page
             total = (data.get("meta") or {}).get("size")
-            if not chunk or len(chunk) < PAGE:
+            if not chunk or len(chunk) < page:
                 break
             if total is not None and offset >= total:
                 break
@@ -196,35 +197,48 @@ class MS:
         return out
 
     # --- продажи ----------------------------------------------------------
-    # Отчёты, где лежат продажи по товарам. Порядок — от самого
-    # подходящего к запасному. Пустой ответ не считается успехом:
-    # переходим к следующему источнику.
-    _SALES = (
-        ("/report/turnover/all", {"groupBy": "product"}),
-        ("/report/sales/byproduct", {}),
-        ("/report/profit/byproduct", {"groupBy": "product"}),
-    )
-
-    def sales(self, days: int, debug: bool = False) -> dict[str, float]:
+    def sales(self, days: int = 28, debug: bool = False) -> dict[str, float]:
         """Продажи в штуках за период по всем складам: id -> количество.
 
-        Пробуем несколько источников. Первый непустой ответ выигрывает.
-        Если все отчёты пусты — идём в документы отгрузки: «продаж нет»
-        и «отчёт не отдал данные» — разные вещи, и путать их нельзя.
-        """
-        until = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
-            "%Y-%m-%d %H:%M:%S")
+        Порядок поиска — от самого быстрого:
+          1. отчёт по оборотам (2 запроса);
+          2. документы отгрузки с раскрытыми позициями (limit=100 —
+             только при таком лимите МойСклад отдаёт positions.rows
+             прямо в списке, без запроса на каждый документ);
+          3. поштучная догрузка позиций — последний рубеж.
 
-        errors: list[str] = []
-        for path, extra in self._SALES:
-            params = {"momentFrom": since, "momentTo": until, **extra}
+        МойСклад ограничивает раскрытие вложенных коллекций: при
+        limit больше 100 позиции в ответ не попадают вовсе. Из-за этого
+        раньше приходилось делать запрос на каждый из 1973 документов.
+        """
+        fast = self._sales_from_report(days)
+        if fast:
+            return fast
+
+        inline = self._sales_inline(days)
+        if inline:
+            return inline
+
+        return self.sales_from_docs(days)
+
+    # --- 1. отчёт ---------------------------------------------------------
+    def _sales_from_report(self, days: int) -> dict[str, float]:
+        """Отчёт по оборотам. Пробуем оба варианта имён параметров дат."""
+        stamps = _period(days)
+        variants = [
+            ("/report/turnover/all", {"groupBy": "product"},
+             {"momentFrom": stamps[0], "momentTo": stamps[1]}),
+            ("/report/turnover/all", {"groupBy": "product"},
+             {"dateFrom": stamps[0], "dateTo": stamps[1]}),
+            ("/report/turnover/all", {},
+             {"momentFrom": stamps[0], "momentTo": stamps[1]}),
+        ]
+
+        for path, extra, dates in variants:
+            params = {**dates, **extra}
             try:
                 out: dict[str, float] = {}
-                sample = None
-                for r in self.rows(path, params):
-                    if sample is None:
-                        sample = r
+                for r in self.rows(path, params, page=100):
                     aid = (r.get("assortment") or {}).get("id")
                     if not aid:
                         continue
@@ -232,93 +246,142 @@ class MS:
                     if qty:
                         out[aid] = out.get(aid, 0.0) + qty
             except MoySkladError as e:
-                log.info("Отчёт %s: %s", path, e)
-                errors.append(f"{path}: {e}")
+                log.info("Отчёт %s %s: %s", path, list(dates)[0], e)
                 continue
 
-            if debug and sample is not None:
-                log.info("Строка %s: %s", path,
-                         {k: sample[k] for k in list(sample)[:12]})
-
             if out:
-                log.info("Продажи (%s): %s позиций за %s дн.", path, len(out), days)
+                log.info("Продажи из отчёта %s: %s позиций за %s дн.",
+                         path, len(out), days)
                 return out
 
-            log.info("Отчёт %s ответил, но продаж нет — пробуем дальше", path)
-            errors.append(f"{path}: ответил пусто")
-
-        log.warning("Отчёты не дали продаж, считаем по документам отгрузки")
-        docs = self.sales_from_docs(days)
-        if docs:
-            log.info("Продажи по документам: %s позиций", len(docs))
-            return docs
-
-        log.warning("Продаж не найдено нигде. %s", "; ".join(errors))
+        log.info("Отчёт по оборотам пуст — идём в документы")
         return {}
 
-    def sales_from_docs(self, days: int) -> dict[str, float]:
-        """Запасной путь: документы отгрузки и розничные продажи.
+    # --- 2. документы с раскрытыми позициями ------------------------------
+    def _sales_inline(self, days: int) -> dict[str, float]:
+        """Документы отгрузки с позициями прямо в ответе.
 
-        Позиции в списке документов приходят пустыми — их надо
-        догружать по ссылке positions.meta.href.
+        limit=100 — требование МойСклад для раскрытия positions. Иначе
+        позиции приходят только ссылкой, и нужен запрос на каждый документ.
         """
-        until = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
-            "%Y-%m-%d %H:%M:%S")
-        filt = f"moment>={since}"
-
+        since = _period(days)[0]
         out: dict[str, float] = {}
         docs_total = 0
+        inline_docs = 0
 
         for path in ("/entity/demand", "/entity/retaildemand"):
             try:
-                docs = list(self.rows(path, {"filter": filt}))
-            except MoySkladError as e:
-                log.info("Документы %s: %s", path, e)
-                continue
-
-            docs_total += len(docs)
-            for doc in docs:
-                for pos in self._positions(doc):
-                    aid = (pos.get("assortment") or {}).get("id")
-                    if not aid:
+                for doc in self.rows(path,
+                                     {"filter": f"moment>={since}",
+                                      "expand": "positions.assortment"},
+                                     page=100):
+                    docs_total += 1
+                    pos = doc.get("positions")
+                    rows = pos.get("rows") if isinstance(pos, dict) else None
+                    if not isinstance(rows, list) or not rows:
                         continue
-                    q = float(pos.get("quantity") or 0) - float(
-                        pos.get("returnedQuantity") or 0)
-                    out[aid] = out.get(aid, 0.0) + q
+                    inline_docs += 1
+                    for p in rows:
+                        aid = (p.get("assortment") or {}).get("id")
+                        if not aid:
+                            continue
+                        q = float(p.get("quantity") or 0) - float(
+                            p.get("returnedQuantity") or 0)
+                        out[aid] = out.get(aid, 0.0) + q
+            except MoySkladError as e:
+                log.info("%s: %s", path, e)
 
         if docs_total:
-            log.info("Документов отгрузки: %s", docs_total)
+            log.info("Документов: %s, с позициями в ответе: %s",
+                     docs_total, inline_docs)
+        if inline_docs:
+            log.info("Продажи из документов: %s позиций, %s шт.",
+                     len(out), sum(out.values()))
         return out
 
-    def _positions(self, doc: dict) -> list[dict]:
-        """Позиции документа: из ответа либо отдельным запросом по ссылке."""
-        pos = doc.get("positions")
-        if isinstance(pos, dict):
-            rows = pos.get("rows")
-            if isinstance(rows, list) and rows:
-                return rows
-            href = (pos.get("meta") or {}).get("href") or ""
-            if href:
-                path = href.split("/api/remap/1.2", 1)[-1]
-                try:
-                    return list(self.rows(path, {"expand": "assortment"}))
-                except MoySkladError as e:
-                    log.info("Позиции %s: %s", path, e)
-        return []
+    # --- 3. последний рубеж ----------------------------------------------
+    def sales_from_docs(self, days: int = 28) -> dict[str, float]:
+        """Поштучная догрузка позиций — только если раскрытие не сработало."""
+        since = _period(days)[0]
+        docs: list[dict] = []
+        for path in ("/entity/demand", "/entity/retaildemand"):
+            try:
+                docs.extend(self.rows(path, {"filter": f"moment>={since}"}))
+            except MoySkladError as e:
+                log.info("%s: %s", path, e)
 
-    # --- диагностика ------------------------------------------------------
+        if not docs:
+            log.warning("Документов отгрузки за %s дн. нет", days)
+            return {}
+
+        log.warning("Догружаем позиции по одному документу: %s шт. — это долго",
+                    len(docs))
+        positions = self._positions_many(docs)
+
+        out: dict[str, float] = {}
+        for idx, _ in enumerate(docs):
+            for p in positions.get(idx) or []:
+                aid = (p.get("assortment") or {}).get("id")
+                if not aid:
+                    continue
+                q = float(p.get("quantity") or 0) - float(
+                    p.get("returnedQuantity") or 0)
+                out[aid] = out.get(aid, 0.0) + q
+
+        log.info("Продажи по документам: %s позиций", len(out))
+        return out
+
+    def _positions_many(self, docs: list[dict], workers: int = 5) -> dict[int, list[dict]]:
+        """Позиции пачки документов параллельно. МойСклад допускает 5 потоков."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        result: dict[int, list[dict]] = {}
+        todo: list[tuple[int, str]] = []
+
+        for i, doc in enumerate(docs):
+            pos = doc.get("positions")
+            if isinstance(pos, dict):
+                rows = pos.get("rows")
+                if isinstance(rows, list) and rows:
+                    result[i] = rows
+                    continue
+                href = (pos.get("meta") or {}).get("href") or ""
+                if href:
+                    todo.append((i, href.split("/api/remap/1.2", 1)[-1]))
+
+        def fetch(item):
+            i, path = item
+            try:
+                return i, list(self.rows(path, {"expand": "assortment"}))
+            except Exception as e:  # noqa: BLE001
+                return i, []
+
+        if todo:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for i, rows in pool.map(fetch, todo):
+                    result[i] = rows
+
+        return result
+
     def probe(self, days: int = 28) -> list[tuple[str, str]]:
-        """Проверяет каждый источник продаж. Возвращает [(источник, итог)]."""
+        """Что реально вернул каждый источник продаж.
+
+        По документам отгрузки смотрим только первые 20 — этого хватает,
+        чтобы понять, приходят ли позиции, и не ждать минуту.
+        """
         until = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
             "%Y-%m-%d %H:%M:%S")
         report: list[tuple[str, str]] = []
 
-        for path, extra in self._SALES:
+        # 1. Отчёты — быстрый путь, но на части тарифов пусты
+        for path, extra in (
+            ("/report/turnover/all", {"groupBy": "product"}),
+            ("/report/turnover/byoperations", {}),
+        ):
             params = {"momentFrom": since, "momentTo": until, **extra}
             try:
-                rows = list(self.rows(path, params))
+                rows = list(self.rows(path, params, page=100))
             except MoySkladError as e:
                 report.append((path, f"ошибка: {e}"))
                 continue
@@ -329,23 +392,33 @@ class MS:
             keys = ", ".join(list(rows[0])[:8])
             report.append((path, f"{len(rows)} строк, штук {qty:.0f} | поля: {keys}"))
 
+        # 2. Документы отгрузки — основной путь
         for path in ("/entity/demand", "/entity/retaildemand"):
             try:
                 docs = list(self.rows(path, {"filter": f"moment>={since}"}))
             except MoySkladError as e:
                 report.append((path, f"ошибка: {e}"))
                 continue
-            with_pos = 0
-            qty = 0.0
-            for d in docs[:20]:                    # выборка, чтобы не ждать
-                pos = self._positions(d)
-                if pos:
-                    with_pos += 1
-                    qty += sum(float(p.get("quantity") or 0) for p in pos)
-            report.append((path, f"{len(docs)} док., из первых 20 с позициями "
-                                 f"{with_pos}, штук {qty:.0f}"))
+            if not docs:
+                report.append((path, "документов за период нет"))
+                continue
+
+            sample = docs[:20]
+            positions = self._positions_many(sample)
+            with_pos = sum(1 for i in range(len(sample)) if positions.get(i))
+            qty = sum(float(p.get("quantity") or 0)
+                      for rows in positions.values() for p in rows)
+            report.append((path, f"{len(docs)} док. | из первых {len(sample)} "
+                                 f"с позициями {with_pos}, штук {qty:.0f}"))
 
         return report
+
+
+def _period(days: int) -> tuple[str, str]:
+    """(с, по) в формате, который ждёт МойСклад."""
+    now = datetime.now(timezone.utc)
+    return ((now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S"),
+            now.strftime("%Y-%m-%d %H:%M:%S"))
 
 
 def _barcodes(entity: dict) -> list[str]:
