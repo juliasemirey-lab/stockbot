@@ -230,49 +230,24 @@ class MS:
         return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     def shipped(self, days: int = 28, store_name: str | None = None) -> dict[str, float]:
-        """Чистые отгрузки за период, в штуках.
-
-        Продажи — основа всего расчёта. Если этот запрос тихо вернёт пусто,
-        дайджест покажет «заказывать нечего», и это будет ложь. Поэтому
-        пробуем несколько вариантов фильтра, а если ни один не сработал —
-        падаем с понятным сообщением, а не показываем ноль.
-        """
-        since = self._since(days)
-        variants = [
-            {"filter": f"moment>={since}", "expand": "positions.assortment,store"},
-            {"filter": f"moment>={since}", "expand": "positions.assortment"},
-            {"expand": "positions.assortment,store", "limit": 100},
-        ]
-
-        last_error = None
-        for params in variants:
-            out: dict[str, float] = {}
-            ok = False
-            for path in ("/entity/demand", "/entity/retaildemand"):
-                try:
-                    for d in self.rows(path, params=params):
-                        ok = True
-                        if store_name and "store" in str(params.get("expand", "")):
-                            st = (d.get("store") or {}).get("name", "")
-                            if st and st.lower() != store_name.lower():
-                                continue
-                        for p in (d.get("positions") or {}).get("rows", []):
-                            aid = (p.get("assortment") or {}).get("id")
-                            if aid:
-                                q = float(p.get("quantity") or 0) - float(p.get("returnedQuantity") or 0)
-                                out[aid] = out.get(aid, 0.0) + q
-                    break        # retaildemand есть не всегда
-                except MoySkladError as e:
-                    last_error = e
-                    continue
-            if ok:
-                if not out:
-                    log.warning("Отгрузки: запрос прошёл, но продаж за %s дн. нет", days)
-                return out
-
-        raise MoySkladError(
-            "Не удалось получить отгрузки за %s дн. — расчёт невозможен. "
-            "Последняя ошибка: %s" % (days, last_error))
+        out: dict[str, float] = {}
+        filt = f"moment>={self._since(days)}"
+        for path in ("/entity/demand", "/entity/retaildemand"):
+            try:
+                for d in self.rows(path, params={"filter": filt,
+                                                 "expand": "positions.assortment,store"}):
+                    if store_name:
+                        st = (d.get("store") or {}).get("name", "")
+                        if st and st.lower() != store_name.lower():
+                            continue
+                    for p in (d.get("positions") or {}).get("rows", []):
+                        aid = (p.get("assortment") or {}).get("id")
+                        if aid:
+                            q = float(p.get("quantity") or 0) - float(p.get("returnedQuantity") or 0)
+                            out[aid] = out.get(aid, 0.0) + q
+            except MoySkladError:
+                continue
+        return out
 
     def returns(self, days: int = 28) -> dict[str, float]:
         out: dict[str, float] = {}

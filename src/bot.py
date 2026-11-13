@@ -33,7 +33,7 @@ def collect(cfg: dict):
 async def send_digest(target, bot: Bot | None = None):
     """Сводка + сообщение на каждого поставщика + CSV."""
     lines, today, warns = collect(CFG)
-    summary = render_summary(lines, today, warns, top_n=int(CFG.get("top_n_in_chat", 8)))
+    summary = render_summary(lines, today, warns, cfg=CFG, top_n=int(CFG.get("top_n_in_chat", 10)))
     path = f"/tmp/digest_{today:%Y%m%d}.csv"
     with open(path, "wb") as f:
         f.write(render_csv(lines, CFG, only_action=True))

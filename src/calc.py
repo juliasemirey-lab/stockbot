@@ -54,6 +54,12 @@ def month_factor(seasonality: list[float], day: date) -> float:
     return 0.15 * s[(day.month - 2) % 12] + 0.70 * s[day.month - 1] + 0.15 * s[day.month % 12]
 
 
+def season_ratio(seasonality: list[float], target: date, history_mid: date) -> float:
+    """Отношение сезона целевой даты к сезону месяца, за который измерен темп."""
+    base = month_factor(seasonality, history_mid)
+    return 1.0 if base <= 0.01 else month_factor(seasonality, target) / base
+
+
 def season_ratio_days(seasonality: list[float], window: list[date],
                       history_mid: date) -> list[float]:
     """Поправка на сезон по каждому дню окна.
@@ -351,3 +357,64 @@ def group_by_supplier(lines: list[Line]) -> dict[str, list[Line]]:
         key = ln.supplier or "Поставщик не определён"
         out.setdefault(key, []).append(ln)
     return out
+
+
+def seasonal_note(cfg: dict, lines: list) -> str:
+    """Короткая фраза о сезонном влиянии на окно.
+
+    Берём среднее отношение сезона к годовой базе по непустым категориям
+    (где есть продажи и позиции в закупке). Фраза — одна, для шапки.
+    """
+    if not lines:
+        return ""
+    seas_all = cfg.get("seasonality") or {}
+    if not seas_all:
+        return ""
+    ws = lines[0].window_start
+    hist_mid_shift = int(cfg.get("velocity_window_days", 28)) // 2
+    from datetime import timedelta
+    hist_mid = ws - timedelta(days=hist_mid_shift)
+
+    cats_active: dict[str, int] = {}
+    for ln in lines:
+        if ln.base_daily > 0 or ln.need > 0:
+            cats_active[ln.category] = cats_active.get(ln.category, 0) + 1
+    if not cats_active:
+        return ""
+
+    ratios = []
+    rising, falling = [], []
+    cat_titles = {k: (v or {}).get("title", k)
+                  for k, v in (cfg.get("categories") or {}).items()}
+    for cat, weight in cats_active.items():
+        seas = seas_all.get(cat)
+        if not seas:
+            continue
+        r = season_ratio([float(x) for x in seas], ws, hist_mid)
+        ratios.append(r)
+        title = cat_titles.get(cat, cat)
+        if r >= 1.15:
+            rising.append((r, title))
+        elif r <= 0.85:
+            falling.append((r, title))
+
+    if not ratios:
+        return ""
+    avg = sum(ratios) / len(ratios)
+    if 0.92 <= avg <= 1.08 and not rising and not falling:
+        return "с учётом сезонности · ассортимент в межсезонье, спрос ровный"
+
+    rising.sort(reverse=True)
+    falling.sort()
+    parts = []
+    if rising:
+        top = ", ".join(t for _, t in rising[:2])
+        parts.append(f"растёт спрос: {top}")
+    if falling:
+        bot_ = ", ".join(t for _, t in falling[:2])
+        parts.append(f"уходит сезон: {bot_}")
+    if not parts:
+        # одинаковое смещение по всем категориям
+        direction = "выше" if avg > 1 else "ниже"
+        parts.append(f"спрос в целом {direction} среднегодового")
+    return "с учётом сезонности · " + "; ".join(parts)

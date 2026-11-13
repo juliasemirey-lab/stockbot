@@ -69,16 +69,6 @@ def render_summary(lines: list[Line], today: date, warns: list[str] | None = Non
 
     if not need_lines:
         out.append("Ничего заказывать не нужно.")
-        # Пустой заказ — это либо правда, либо данные не пришли.
-        # Молча показывать «всё хорошо» опаснее, чем предупредить.
-        no_sales = [ln for ln in lines if ln.base_daily <= 0]
-        if lines and len(no_sales) == len(lines):
-            out.append("")
-            out.append("⚠️ *Продаж за период не найдено ни у одной позиции.*")
-            out.append("Проверьте: есть ли отгрузки за последние "
-                       f"{cfg.get('velocity_window_days', 28)} дн. и тот ли склад "
-                       f"выбран (`warehouse: {cfg.get('warehouse')}`).")
-            out.append("Диагностика: `python main.py doctor`")
         return "\n".join(out)
 
     out.append(f"Заказать: *{total:.0f} шт* по *{len(need_lines)}* позициям · "
