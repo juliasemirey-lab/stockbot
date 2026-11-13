@@ -1,6 +1,7 @@
 """Клиент API МойСклад 1.2: пагинация, лимиты, справочники, остатки, поступления."""
 from __future__ import annotations
 
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,8 @@ import httpx
 
 BASE = "https://api.moysklad.ru/api/remap/1.2"
 PAGE = 1000
+log = logging.getLogger("stockbot.ms")
+
 BARCODE_KEYS = ("ean13", "gtin", "ean8", "upc", "code128")
 
 
@@ -53,6 +56,13 @@ class MS:
                     raise MoySkladError(f"403 на {path}: нет прав у токена")
                 if r.status_code == 404:
                     return
+                if r.status_code == 412:
+                    body = r.text[:300].replace("\n", " ")
+                    raise MoySkladError(
+                        f"412 на {path}: МойСклад не принял параметры запроса. {body}")
+                if 400 <= r.status_code < 500:
+                    body = r.text[:300].replace("\n", " ")
+                    raise MoySkladError(f"HTTP {r.status_code} на {path}: {body}")
                 if r.status_code >= 500:
                     if attempt == 5:
                         raise MoySkladError(f"{path}: HTTP {r.status_code}")
@@ -173,46 +183,96 @@ class MS:
         return out
 
     def reserve_from_orders(self, store_name: str | None = None) -> dict[str, float]:
-        out: dict[str, float] = {}
-        try:
-            for o in self.rows("/entity/customerorder",
-                               params={"filter": "shipped=false",
-                                       "expand": "positions.assortment,store"}):
-                if store_name:
-                    st = (o.get("store") or {}).get("name", "")
-                    if st and st.lower() != store_name.lower():
+        """Резерв из неотгруженных заказов покупателей — запасной источник.
+
+        В МойСклад фильтр `shipped=false` на customerorder на части
+        конфигураций отдаёт 412: состав фильтруемых полей зависит от
+        тарифа и включённых модулей. Поэтому пробуем несколько вариантов
+        от простого к сложному, а если ни один не прошёл — возвращаем
+        пусто: основной расчёт падать из-за этого не должен, резерв
+        возьмётся из отчёта об остатках.
+
+        Отдаёт: assortmentId -> количество в неотгруженных заказах.
+        """
+        attempts = [
+            {"filter": "shipped=false", "expand": "positions.assortment"},
+            {"expand": "positions.assortment"},
+            {"expand": "positions.assortment", "limit": 100},
+        ]
+
+        for params in attempts:
+            try:
+                out: dict[str, float] = {}
+                for o in self.rows("/entity/customerorder", params=params):
+                    if o.get("shipped"):
                         continue
-                for p in (o.get("positions") or {}).get("rows", []):
-                    aid = (p.get("assortment") or {}).get("id")
-                    if aid:
-                        out[aid] = out.get(aid, 0.0) + float(p.get("quantity") or 0)
-        except MoySkladError:
-            pass
-        return out
+                    if store_name:
+                        st = (o.get("store") or {}).get("name", "")
+                        if st and st.lower() != store_name.lower():
+                            continue
+                    for p in (o.get("positions") or {}).get("rows", []):
+                        aid = (p.get("assortment") or {}).get("id")
+                        if aid:
+                            out[aid] = out.get(aid, 0.0) + float(p.get("quantity") or 0)
+                if out:
+                    log.info("Резерв из заказов: %s позиций", len(out))
+                return out
+            except Exception as e:  # noqa: BLE001 — запасной источник
+                log.warning("Резерв из заказов (%s) не сработал: %s",
+                            params.get("filter", "без фильтра"), e)
+                continue
+
+        log.warning("Заказы покупателей недоступны — резерв берём из отчёта об остатках")
+        return {}
 
     # --- отгрузки и возвраты --------------------------------------------
     def _since(self, days: int) -> str:
         return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     def shipped(self, days: int = 28, store_name: str | None = None) -> dict[str, float]:
-        out: dict[str, float] = {}
-        filt = f"moment>={self._since(days)}"
-        for path in ("/entity/demand", "/entity/retaildemand"):
-            try:
-                for d in self.rows(path, params={"filter": filt,
-                                                 "expand": "positions.assortment,store"}):
-                    if store_name:
-                        st = (d.get("store") or {}).get("name", "")
-                        if st and st.lower() != store_name.lower():
-                            continue
-                    for p in (d.get("positions") or {}).get("rows", []):
-                        aid = (p.get("assortment") or {}).get("id")
-                        if aid:
-                            q = float(p.get("quantity") or 0) - float(p.get("returnedQuantity") or 0)
-                            out[aid] = out.get(aid, 0.0) + q
-            except MoySkladError:
-                continue
-        return out
+        """Чистые отгрузки за период, в штуках.
+
+        Продажи — основа всего расчёта. Если этот запрос тихо вернёт пусто,
+        дайджест покажет «заказывать нечего», и это будет ложь. Поэтому
+        пробуем несколько вариантов фильтра, а если ни один не сработал —
+        падаем с понятным сообщением, а не показываем ноль.
+        """
+        since = self._since(days)
+        variants = [
+            {"filter": f"moment>={since}", "expand": "positions.assortment,store"},
+            {"filter": f"moment>={since}", "expand": "positions.assortment"},
+            {"expand": "positions.assortment,store", "limit": 100},
+        ]
+
+        last_error = None
+        for params in variants:
+            out: dict[str, float] = {}
+            ok = False
+            for path in ("/entity/demand", "/entity/retaildemand"):
+                try:
+                    for d in self.rows(path, params=params):
+                        ok = True
+                        if store_name and "store" in str(params.get("expand", "")):
+                            st = (d.get("store") or {}).get("name", "")
+                            if st and st.lower() != store_name.lower():
+                                continue
+                        for p in (d.get("positions") or {}).get("rows", []):
+                            aid = (p.get("assortment") or {}).get("id")
+                            if aid:
+                                q = float(p.get("quantity") or 0) - float(p.get("returnedQuantity") or 0)
+                                out[aid] = out.get(aid, 0.0) + q
+                    break        # retaildemand есть не всегда
+                except MoySkladError as e:
+                    last_error = e
+                    continue
+            if ok:
+                if not out:
+                    log.warning("Отгрузки: запрос прошёл, но продаж за %s дн. нет", days)
+                return out
+
+        raise MoySkladError(
+            "Не удалось получить отгрузки за %s дн. — расчёт невозможен. "
+            "Последняя ошибка: %s" % (days, last_error))
 
     def returns(self, days: int = 28) -> dict[str, float]:
         out: dict[str, float] = {}
