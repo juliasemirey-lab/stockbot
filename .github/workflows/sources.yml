@@ -1,0 +1,27 @@
+name: sources
+
+# Диагностика источников продаж: показывает, что вернул каждый отчёт.
+# Запускать, когда дайджест говорит «заказывать нечего».
+on:
+  workflow_dispatch:
+
+jobs:
+  sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Зависимости
+        run: pip install -q -r requirements.txt
+
+      - name: Источники
+        env:
+          MOYSKLAD_TOKEN: ${{ secrets.MOYSKLAD_TOKEN }}
+        run: python main.py sources
