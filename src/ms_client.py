@@ -230,29 +230,105 @@ class MS:
         return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     def _doc_positions(self, doc: dict) -> list[dict]:
-        """Позиции документа.
-
-        В списке документов `positions` приходит либо готовым блоком с rows,
-        либо только ссылкой meta.href — во втором случае подгружаем отдельно.
-        Именно из-за этого отгрузки раньше считались нулевыми: документы
-        есть, а позиции не разобраны.
-        """
+        """Позиции документа, если они уже пришли в ответе."""
         pos = doc.get("positions")
         if isinstance(pos, dict):
             rows = pos.get("rows")
             if isinstance(rows, list) and rows:
                 return rows
-            href = (pos.get("meta") or {}).get("href", "")
-            if href:
-                path = href.split("/api/remap/1.2", 1)[-1]
-                try:
-                    return list(self.rows(path, params={"expand": "assortment"}))
-                except MoySkladError as e:
-                    log.warning("Не удалось получить позиции %s: %s", path, e)
         return []
 
+    def _positions_href(self, doc: dict) -> str:
+        pos = doc.get("positions")
+        if isinstance(pos, dict):
+            return (pos.get("meta") or {}).get("href", "") or ""
+        return ""
+
+    def fill_positions(self, docs: list[tuple[str, dict]],
+                       workers: int = 6) -> dict[int, list[dict]]:
+        """Догружает позиции всех документов одной пачкой, параллельно.
+
+        Запрашивать по одному документу нельзя: за месяц отгрузок бывают
+        сотни, и последовательная загрузка растягивает расчёт на минуты.
+        Позиции, пришедшие прямо в ответе, не перезапрашиваются.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        result: dict[int, list[dict]] = {}
+        todo: list[tuple[int, str]] = []
+
+        for i, (_, d) in enumerate(docs):
+            rows = self._doc_positions(d)
+            if rows:
+                result[i] = rows
+                continue
+            href = self._positions_href(d)
+            if href:
+                todo.append((i, href.split("/api/remap/1.2", 1)[-1]))
+
+        if todo:
+            log.info("Позиции: %s документов уже с позициями, %s догружаем",
+                     len(result), len(todo))
+
+        def fetch(item):
+            i, path = item
+            try:
+                return i, list(self.rows(path, params={"expand": "assortment"}))
+            except Exception as e:  # noqa: BLE001
+                log.warning("Позиции %s не получены: %s", path, e)
+                return i, []
+
+        if todo:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for i, positions in pool.map(fetch, todo):
+                    result[i] = positions
+
+        return result
+
+    def _sales_report(self, days: int, store_name: str | None) -> dict[str, float] | None:
+        """Продажи из готового отчёта — несколько запросов вместо сотен.
+
+        Обход документов отгрузки требует отдельного запроса на позиции
+        каждого документа: за месяц это сотни запросов и минуты ожидания.
+        Отчёт /report/sales/byproduct отдаёт продажи по товарам сразу,
+        сгруппированными, и укладывается в пару страниц.
+        """
+        moment_from = self._since(days)
+        moment_to = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        params = {"momentFrom": moment_from, "momentTo": moment_to}
+
+        out: dict[str, float] = {}
+        try:
+            for r in self.rows("/report/sales/byproduct", params=params):
+                aid = (r.get("assortment") or {}).get("id")
+                if not aid:
+                    continue
+                qty = float(r.get("sellQuantity") or 0) - float(r.get("returnQuantity") or 0)
+                if qty:
+                    out[aid] = out.get(aid, 0.0) + qty
+        except MoySkladError as e:
+            log.warning("Отчёт по продажам недоступен, считаем по документам: %s", e)
+            return None
+
+        log.info("Продажи из отчёта: %s позиций за %s дн.", len(out), days)
+        return out
+
+    def shipped(self, days: int = 28, store_name: str | None = None) -> dict[str, float]:
+        """Чистые отгрузки в штуках: assortmentId -> количество.
+
+        Основной источник — отчёт по продажам (быстро). Если он недоступен,
+        fallback на обход документов отгрузки.
+        """
+        reported = self._sales_report(days, store_name)
+        if reported is not None:
+            return reported
+        return self._shipped_from_docs(days, store_name)
+
     def shipped_raw(self, days: int = 28) -> list[tuple[str, dict]]:
-        """Документы отгрузок за период: список (тип, документ)."""
+        """Документы отгрузок за период: список (тип, документ).
+
+        Запасной путь на случай, если отчёт по продажам недоступен.
+        """
         since = self._since(days)
         variants = [
             {"filter": f"moment>={since}", "expand": "positions.assortment,store"},
@@ -271,38 +347,28 @@ class MS:
                 except MoySkladError as e:
                     last_error = e
             if got_answer:
-                with_pos = sum(1 for _, d in docs if self._has_positions(d))
-                log.info("Отгрузки: документов %s, с позициями %s",
-                         len(docs), with_pos)
+                log.info("Отгрузки по документам: %s шт.", len(docs))
                 return docs
         raise MoySkladError(
             f"Не удалось получить отгрузки за {days} дн. — расчёт невозможен. "
             f"Последняя ошибка: {last_error}")
 
-    @staticmethod
-    def _has_positions(doc: dict) -> bool:
-        pos = doc.get("positions")
-        if not isinstance(pos, dict):
-            return False
-        rows = pos.get("rows")
-        return isinstance(rows, list) and len(rows) > 0
-
-    def shipped(self, days: int = 28, store_name: str | None = None) -> dict[str, float]:
-        """Чистые отгрузки в штуках: assortmentId -> количество."""
+    def _shipped_from_docs(self, days: int, store_name: str | None) -> dict[str, float]:
+        """Запасной путь: обход документов отгрузки с догрузкой позиций."""
         docs = self.shipped_raw(days)
+        positions_by_doc = self.fill_positions(docs)
         matched_store = 0
         no_positions = 0
         out: dict[str, float] = {}
 
-        for kind, d in docs:
+        for idx, (kind, d) in enumerate(docs):
             if store_name:
                 st = (d.get("store") or {}).get("name", "")
-                # если склад в документе не раскрыт — не отбрасываем документ
                 if st and st.lower() != store_name.lower():
                     continue
                 matched_store += 1
 
-            positions = self._doc_positions(d)
+            positions = positions_by_doc.get(idx) or []
             if not positions:
                 no_positions += 1
                 continue
@@ -317,10 +383,9 @@ class MS:
         if docs and store_name and matched_store == 0:
             stores = sorted({(d.get("store") or {}).get("name", "—") for _, d in docs})
             log.warning("Отгрузки есть (%s док.), но ни одна не на складе %r. "
-                        "Склады в отгрузках: %s", len(docs), store_name, ", ".join(stores))
+                        "Склады: %s", len(docs), store_name, ", ".join(stores))
         if no_positions:
             log.warning("В %s документах не удалось прочитать позиции", no_positions)
-
         return out
 
     def returns(self, days: int = 28) -> dict[str, float]:
