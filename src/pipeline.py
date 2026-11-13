@@ -83,7 +83,10 @@ def build_rows_from_ms(ms: MS, cfg: dict, with_links: bool = True) -> list[dict]
     stock = ms.stock(store)                       # только нужный склад
     shipped = ms.shipped(window, store)
     returns = ms.returns(window)
-    reserve_acc = ms.reserve_from_orders(store)
+        try:
+            reserve_acc = ms.reserve_from_orders(store)
+        except Exception:
+            reserve_acc = {}
     arrivals_by_sku, first_receipt = ms.arrivals_with_eta(now, store)
     supplier_by_sku = ms.supplier_map(sup_attr)
     wb_index = _wb_index(cfg) if with_links else {}
