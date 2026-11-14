@@ -122,10 +122,12 @@ class MS:
         # В API товара поле называется folder, у модификации — product.folder.
         # Варианты expand: сначала с папкой (нужны имена), потом без —
         # если сервер не принял параметр.
+        # page=100 обязателен: при большем limit МойСклад выбрасывает expand,
+        # и папки приходят без имён — тогда все товары уходят в «Всесезон».
         for expand in ("folder", ""):
             try:
                 params = {"expand": expand} if expand else None
-                for p in self.rows("/entity/product", params):
+                for p in self.rows("/entity/product", params, page=100):
                     info = _describe(p, None)
                     if not keep(info["folder"]):
                         continue
@@ -136,7 +138,7 @@ class MS:
 
         for expand in ("product.folder", "product"):
             try:
-                for v in self.rows("/entity/variant", {"expand": expand}):
+                for v in self.rows("/entity/variant", {"expand": expand}, page=100):
                     info = _describe(v.get("product") or {}, v)
                     if not keep(info["folder"]):
                         continue
