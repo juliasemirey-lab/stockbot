@@ -1,23 +1,31 @@
 """Текст дайджеста и CSV.
 
-Сообщение уходит с parse_mode=HTML, поэтому все названия экранируются:
-подчёркивания и звёздочки в артикулах иначе съедали пробелы.
+Структура сообщения подчинена одному правилу: в чат попадает только то, по
+чему нужно действовать на этой неделе. Всё остальное уходит в CSV, но в
+сообщении остаётся строка с весом файла — иначе его никто не откроет.
 
-Тон меняется по ситуации: загруженная неделя — собранно и по делу,
-тихая — спокойно. Метки срочности ставятся по числу дней запаса,
-ссылки идут голым адресом без подписи [WB].
+    🧵 Закупка на 16–22 ноября
+    13 позиций срочно · 304 шт
+
+    🔥 Горит
+    [позиции с размерными сетками]
+
+    ⬇ В файле 219 позиций, 681 шт · 47 с высокими продажами · 120 с вымытой сеткой
+
+Числа в строке про файл — не украшение: 681 шт больше, чем в сообщении,
+и это единственное, что заставляет файл открыть.
+
+Ссылки идут голым адресом. Подпись [WB] рядом с ними в тексте не ставится.
 """
 from __future__ import annotations
 
 from datetime import date, timedelta
 from html import escape
 
-from calc import Item, window_start
+from calc import Group, window_start
 
-# метка, если остатка хватает меньше чем на столько дней
-HOT = 3
-SOON = 8
-MAX_BLOCKS = 5
+MAX_CHARS = 4096          # лимит Telegram на одно сообщение
+SAFE_CHARS = 3800         # оставляем запас: разбивка на два сообщения хуже обрезки
 
 
 def _plural(n: int, one: str, few: str, many: str) -> str:
@@ -41,148 +49,178 @@ def _week(start: date, horizon: int = 7) -> str:
             f"{end.day} {months[end.month - 1]}")
 
 
-def _line(it: Item) -> str:
-    """Строка позиции: остаток, на сколько хватит, сколько заказать."""
-    head = escape(it.name)
-    tail_bits = [b for b in (it.color, it.size) if b]
-    if tail_bits:
-        head += " · " + " · ".join(escape(b) for b in tail_bits)
+def _sizes_line(g: Group) -> str:
+    """Размерная сетка одной строкой: остаток → заказ.
 
-    parts = []
-    parts.append(f"осталось <b>{it.available:.0f}</b>")
-    if it.cover_days is not None:
-        d = int(it.cover_days)
-        if d <= 0:
-            parts.append("закончился")
+    Показываются только размеры, которые надо заказать: остальные не несут
+    решения и удлиняют строку. Ярмарочный остаток идёт отдельным слагаемым
+    «0+1⛺», потому что он входит в покрытие, но физически лежит не на полке.
+    """
+    given: dict[str, float] = {}
+    for _src, qty, dst in g.moves:
+        given[dst] = given.get(dst, 0.0) + float(qty)
+
+    bits = []
+    for it in g.sorted_items():
+        # показываем потребность ДО подмены: это реальный дефицит размера.
+        # Что снимается перемаркировкой — видно пометкой «(подмена N)» и строкой
+        # ниже, а итог считается уже после подмены. Без пометки строка нечитаема:
+        # сумма чисел в сетке не равна итогу и непонятно, откуда разница.
+        n = it.need
+        if n <= 0:
+            continue
+        label = escape(it.size) if it.size else "—"
+        if it.yard > 0:
+            bit = f"{label} {it.available:.0f}+{it.yard:.0f}⛺→{n:.0f}"
         else:
-            parts.append(f"хватит на {d} {_plural(d, 'день', 'дня', 'дней')}")
-    else:
-        parts.append("продаж не было")
-    parts.append(f"→ нужно <b>{it.need:.0f}</b>")
-
-    body = " · ".join(parts)
-    if it.supplier and it.supplier != "—":
-        body += f"   <i>{escape(it.supplier)}</i>"
-
-    out = [head, body]
-    if it.wb_url:
-        out.append(it.wb_url)
-    return "\n".join(out)
+            bit = f"{label} {it.available:.0f}→{n:.0f}"
+        if given.get(it.size):
+            bit += f" (подмена {given[it.size]:.0f})"
+        bits.append(bit)
+    return " · ".join(bits)
 
 
-def _header(need: list[Item], start: date, horizon: int) -> list[str]:
-    total = sum(i.need for i in need)
-    n = len(need)
-    hot = [i for i in need if i.cover_days is not None and i.cover_days <= HOT]
+def _group_block(g: Group) -> list[str]:
+    head = escape(g.stem_display or g.stem)
 
-    out = [f"🧵 <b>Закупка на неделю {_week(start, horizon)}</b>", ""]
+    out = [head, _sizes_line(g), f"итого к заказу {g.total_order:.0f}"]
 
-    if hot:
-        out.append(
-            f"{n} {_plural(n, 'позиция', 'позиции', 'позиций')}, "
-            f"{total:.0f} шт. "
-            f"{_plural(len(hot), 'Одна кончится', 'Кончатся', 'Кончатся')} "
-            f"в ближайшие дни: <b>{len(hot)}</b> — "
-            f"если не заказать сейчас, часть недели простоим без товара.")
-    else:
-        out.append(
-            f"{n} {_plural(n, 'позиция', 'позиции', 'позиций')}, "
-            f"{total:.0f} шт. Ничего не горит — можно заказать без спешки.")
+    if g.moves:
+        for src, qty, dst in g.moves:
+            out.append(f"перемаркировать {qty:.0f} шт: {escape(src)} → {escape(dst)}")
 
-    out.append("")
+    if g.wb_url:
+        out.append(g.wb_url)
     return out
 
 
-def _supplier_totals(need: list[Item]) -> list[tuple[str, float, int]]:
-    acc: dict[str, list] = {}
-    for it in need:
-        key = it.supplier or "Без поставщика"
-        rec = acc.setdefault(key, [0.0, 0])
-        rec[0] += it.need
-        rec[1] += 1
-    rows = [(k, v[0], v[1]) for k, v in acc.items()]
-    rows.sort(key=lambda x: -x[1])
-    return rows
+def _supplier_blocks(groups: list[Group]) -> list[str]:
+    """Поставщик заголовком, под ним его позиции. Порядок — по объёму заказа."""
+    acc: dict[str, list[Group]] = {}
+    for g in groups:
+        key = g.supplier or "Без поставщика"
+        acc.setdefault(key, []).append(g)
+
+    blocks = sorted(acc.items(), key=lambda kv: -sum(g.total_order for g in kv[1]))
+    out: list[str] = []
+    for name, items in blocks:
+        qty = sum(g.total_order for g in items)
+        out.append(f"<b>{escape(name)}</b> — {len(items)} "
+                   f"{_plural(len(items), 'позиция', 'позиции', 'позиций')} · "
+                   f"{qty:.0f} шт")
+        out.append("")
+        for g in items:
+            out += _group_block(g)
+            out.append("")
+    return out
 
 
-def digest(need: list[Item], today: date, top_n: int = 15,
+def _file_line(rest: list[Group]) -> list[str]:
+    """Строка про файл. Показывает вес, иначе файл не откроют."""
+    if not rest:
+        return []
+    qty = sum(g.total_order for g in rest)
+    solds = sorted(g.sold_total for g in rest)
+    median = solds[len(solds) // 2] if solds else 0.0
+    strong = sum(1 for g in rest if g.sold_total > median)
+    # считаем по реальному дефициту — той же линейкой, что и «🔥 Горит».
+    # Иначе в одном сообщении две разные метрики с одним названием.
+    high = sum(1 for g in rest if g.hard_depleted_share >= 0.5)
+    line = (f"⬇ <b>В файле {len(rest)} "
+            f"{_plural(len(rest), 'позиция', 'позиции', 'позиций')}, {qty:.0f} шт</b>")
+    bits = []
+    if strong:
+        bits.append(f"{strong} продаются выше среднего")
+    if high:
+        bits.append(f"{high} с вымытой сеткой")
+    out = [line]
+    if bits:
+        out.append("<i>" + " · ".join(bits) + " · размеры, поставщики, ссылки</i>")
+    return out
+
+
+def _hot_body(shown: list[Group], total: int) -> list[str]:
+    """Блок «Горит». Если показаны не все — подпись «топ N из M»."""
+    head = ["<b>🔥 Горит</b>"]
+    if len(shown) < total:
+        head.append(f"<i>топ {len(shown)} из {total}</i>")
+    return head + [""] + _supplier_blocks(shown)
+
+
+def digest(hot: list[Group], rest: list[Group], today: date,
            horizon: int = 7) -> str:
+    """hot — то, что горит. rest — всё остальное, уходит в файл.
+
+    Если сообщение не влезает в лимит Telegram, горящие обрезаются по количеству
+    и остаток переезжает в файл: лучше короткое сообщение, чем два.
+    """
     start = window_start(today)
+    head = [f"🧵 <b>Закупка на {_week(start, horizon)}</b>", ""]
 
-    if not need:
-        return _empty(start, horizon)
+    hot_qty = sum(g.total_order for g in hot)
+    rest_qty = sum(g.total_order for g in rest)
 
-    out = _header(need, start, horizon)
+    if not hot:
+        if rest:
+            head.append(f"Срочного нет. В файле {len(rest)} "
+                        f"{_plural(len(rest), 'позиция', 'позиции', 'позиций')}, "
+                        f"{rest_qty:.0f} шт — плановая докупка.")
+        else:
+            head.append("Заказывать нечего — запаса хватает до конца недели.")
+        return "\n".join(head).rstrip()
 
-    hot = [i for i in need if i.cover_days is not None and i.cover_days <= HOT]
-    soon = [i for i in need if i.cover_days is None or i.cover_days > HOT]
+    head.append(f"<b>{len(hot)}</b> "
+                f"{_plural(len(hot), 'позиция', 'позиции', 'позиций')} срочно · "
+                f"{hot_qty:.0f} шт")
+    head.append("")
 
-    shown = 0
+    body = _hot_body(hot, len(hot))
+    tail = [""] + _file_line(rest)
 
-    if hot:
-        out.append("<b>🔥 Горит</b>")
-        out.append("")
-        for it in hot[:top_n]:
-            out.append(_line(it))
-            out.append("")
-            shown += 1
+    text = "\n".join(head + body + tail).rstrip()
+    if len(text) <= SAFE_CHARS:
+        return text
 
-    if soon and shown < top_n:
-        out.append("<b>⏳ Дотянет до конца недели, но впритык</b>")
-        out.append("")
-        for it in soon[:top_n - shown]:
-            out.append(_line(it))
-            out.append("")
-            shown += 1
+    # не влезло — обрезаем горящие, остаток переезжает в файл.
+    # tail пересобирается на каждом шаге: в нём должно быть ВСЁ, что не влезло
+    # в сообщение, иначе в тексте окажутся две разные строки про файл.
+    # Остаток берём срезом hot[len(shown):] — pop() снимает с конца, поэтому
+    # срез всегда точен. Сравнение по значению здесь соврало бы на похожих группах.
+    shown = list(hot)
+    body = _hot_body(shown, len(hot))
+    tail = [""] + _file_line(rest)
+    while shown and len("\n".join(head + body + tail)) > SAFE_CHARS:
+        shown.pop()
+        body = _hot_body(shown, len(hot))
+        tail = [""] + _file_line(rest + hot[len(shown):])
 
-    rest = len(need) - shown
-    if rest > 0:
-        out.append(f"<i>…и ещё {rest} — в CSV</i>")
-        out.append("")
-
-    totals = _supplier_totals(need)
-    if len(totals) > 1 or totals[0][0] != "Без поставщика":
-        out.append("<b>📦 По поставщикам</b>")
-        out.append("")
-        for name, qty, cnt in totals[:MAX_BLOCKS]:
-            label = escape(name)
-            out.append(f"{label} — <b>{qty:.0f}</b> шт / "
-                       f"{cnt} {_plural(cnt, 'позиция', 'позиции', 'позиций')}")
-        if len(totals) > MAX_BLOCKS:
-            out.append(f"<i>…и ещё {len(totals) - MAX_BLOCKS} "
-                       f"{_plural(len(totals) - MAX_BLOCKS, 'поставщик', 'поставщика', 'поставщиков')}"
-                       f" — в CSV</i>")
-        out.append("")
-
-    out.append("<i>Полный список — в CSV, там же колонка «Поставщик».</i>")
-    return "\n".join(out).rstrip()
+    return "\n".join(head + body + tail).rstrip()
 
 
-def _empty(start: date, horizon: int) -> str:
-    return "\n".join([
-        f"🧵 <b>Закупка на неделю {_week(start, horizon)}</b>",
-        "",
-        "Заказывать нечего — запаса хватает до конца недели.",
-    ])
-
-
-def csv_bytes(need: list[Item]) -> bytes:
+def csv_bytes(hot: list[Group], rest: list[Group]) -> bytes:
+    """Полный список: и горящие, и остальное, с колонкой «Ярус»."""
     import csv
     import io
 
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";", lineterminator="\n")
-    w.writerow(["Артикул", "Товар", "Категория", "Поставщик",
-                "Остаток", "Резерв", "Доступно", "В пути",
-                "Продано за период", "Хватит дней", "Заказать",
-                "Профиль", "Баркоды", "WB"])
-    for it in need:
-        w.writerow([
-            it.article, it.name, it.category, it.supplier,
-            f"{it.stock:.0f}", f"{it.reserve:.0f}", f"{it.available:.0f}",
-            f"{it.in_transit:.0f}", f"{it.sold:.0f}",
-            "" if it.cover_days is None else f"{it.cover_days:.0f}",
-            f"{it.need:.0f}", it.profile,
-            " ".join(it.barcodes), it.wb_url,
-        ])
+    w.writerow(["Ярус", "Поставщик", "Позиция", "Размер", "Артикул",
+                "Остаток", "Ярмарка", "Резерв", "В пути", "Продано за период",
+                "Хватит дней", "Заказать", "Баркоды", "WB"])
+
+    def dump(groups: list[Group], tier: str) -> None:
+        for g in groups:
+            for it in g.sorted_items():
+                n = g.after_move.get(it.size, it.need) if g.after_move else it.need
+                w.writerow([
+                    tier, g.supplier, g.stem_display or g.stem,
+                    it.size, it.article,
+                    f"{it.stock:.0f}", f"{it.yard:.0f}", f"{it.reserve:.0f}",
+                    f"{it.in_transit:.0f}", f"{it.sold:.0f}",
+                    "" if it.cover_days is None else f"{it.cover_days:.0f}",
+                    f"{n:.0f}", " ".join(it.barcodes), it.wb_url,
+                ])
+
+    dump(hot, "горит")
+    dump(rest, "в файле")
     return "\ufeff".encode("utf-8") + buf.getvalue().encode("utf-8")

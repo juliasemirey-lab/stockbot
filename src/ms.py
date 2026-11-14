@@ -3,8 +3,10 @@
 Источники:
   /entity/product            товары + баркоды + поставщик + папка
   /report/stock/bystore      остаток/резерв/ожидание по складам
-  /entity/demand             отгрузки
+  /entity/demand             отгрузки (в т.ч. на маркетплейсы и ФБО)
   /entity/retaildemand       розничные продажи
+  /entity/salesreturn        возвраты покупателей (вычитаются из расхода)
+  /entity/move               перемещения: буфер ФБО, склад Ярмарки
   /entity/counterparty       имена поставщиков
   /entity/organization       тоже (поставщик может ссылаться на организацию)
 """
@@ -49,7 +51,7 @@ class MS:
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept-Encoding": "gzip",
-                "User-Agent": "stockbot/5.0",
+                "User-Agent": "stockbot/6.2",
             },
         )
 
@@ -101,6 +103,31 @@ class MS:
     # --------------------------------------------------------------- склады
     def stores(self) -> dict[str, str]:
         return {s["id"]: s.get("name", "") for s in self.rows("/entity/store")}
+
+    def _store_name(self, store_id: str) -> str:
+        """Имя склада по id. Кэш на инстанс: складов мало, запрос один."""
+        if not store_id:
+            return ""
+        if not hasattr(self, "_store_cache"):
+            self._store_cache: dict[str, str] = {}
+        if not self._store_cache:
+            self._store_cache = self.stores()
+        return self._store_cache.get(store_id, "")
+
+    def _store_of(self, ref: dict | None) -> str:
+        """Имя склада из вложенного объекта документа (name, иначе по ссылке).
+
+        МојСклад в одних документах отдаёт store целиком, в других — только
+        ссылку. Поле name надёжнее: href может прийти с довеском и сравнение
+        по нему молча не проходит.
+        """
+        if not isinstance(ref, dict):
+            return ""
+        name = (ref.get("name") or "").strip().lower()
+        if name:
+            return name
+        sid = _id_from_href((ref.get("meta") or {}).get("href", ""))
+        return self._store_name(sid).strip().lower()
 
     def resolve_store(self, name: str) -> str:
         stores = self.stores()
@@ -155,6 +182,52 @@ class MS:
         return names
 
     # --------------------------------------------------------------- остатки
+    def store_stock(self, names: list[str],
+                    required: str = "") -> dict[str, dict[str, dict]]:
+        """Остатки по нескольким складам за один проход: имя -> id -> запись.
+
+        Один запрос вместо N: /report/stock/bystore отдаёт все склады сразу.
+        Склaд, которого нет в отчёте (пустой), просто не попадёт в результат —
+        это нормально для необязательных складов. Но имя в required обязано
+        найтись: опечатка в конфиге иначе обнулит остаток у всего каталога.
+        """
+        want = {n.strip(): n.strip() for n in names if n and n.strip()}
+        out: dict[str, dict[str, dict]] = {n: {} for n in want}
+        seen: set[str] = set()
+
+        for r in self.rows("/report/stock/bystore"):
+            doc_id = _id_from_href((r.get("meta") or {}).get("href", ""))
+            aid = r.get("assortmentId") or doc_id
+            if not aid:
+                continue
+            for s in r.get("stockByStore") or []:
+                name = (s.get("name") or "").strip()
+                seen.add(name)
+                target = want.get(name)
+                if target is None:
+                    continue
+                rec = out[target].setdefault(
+                    aid, {"stock": 0.0, "reserve": 0.0, "in_transit": 0.0})
+                rec["stock"] += float(s.get("stock") or 0)
+                rec["reserve"] += float(s.get("reserve") or 0)
+                rec["in_transit"] += float(s.get("inTransit") or 0)
+
+        for n, rec in out.items():
+            log.info("Остатки по «%s»: %s позиций", n, len(rec))
+            if not rec:
+                log.warning("Склад «%s» пуст или отсутствует в отчёте. "
+                            "В отчёте есть: %s", n,
+                            ", ".join(sorted(seen)) or "—")
+
+        # Обязательный склад должен найтись: иначе остаток обнулится у всего
+        # каталога, бот выдаст «заказать всё» и это не будет видно в логе.
+        req = (required or "").strip()
+        if req and not out.get(req):
+            raise MoySkladError(
+                f"Склад «{req}» не встретился ни у одной позиции. "
+                f"В отчёте есть склады: {', '.join(sorted(seen)) or '—'}")
+        return out
+
     def stock(self, store_name: str) -> dict[str, dict]:
         """Остаток, резерв, ожидание по одному складу.
 
@@ -201,22 +274,30 @@ class MS:
         return out
 
     # --------------------------------------------------------------- продажи
-    def sales(self, days: int = 28) -> dict[str, float]:
-        """Продажи в штуках за период по всем складам: id -> количество.
+    def sales(self, days: int = 28, store_name: str = "") -> dict[str, float]:
+        """Нетто-отток с основного склада в штуках за период: id -> количество.
 
-        Берём ВСЕ документы отгрузки и розничные продажи, склад не
-        разбираем: товар ушёл с любого склада — спрос состоялся.
+        Считается ровно то, что склад потерял и не вернул:
 
-        Возвраты не вычитаются. По схеме комиссионера отгрузка на
-        маркетплейс — это уже продажа; возврат приходит отдельным
-        документом и оприходуется обратно на основной склад, то есть
-        он уже сидит в остатке. Вычесть его ещё и из продаж — значит
-        занизить спрос дважды.
+          + отгрузки и розничные продажи СО СКЛАДА store_name
+          + перемещения с него на буферы ФБО и на склад «Ярмарки»
+          − перемещения обратно на него (возврат с Ярмарки, отмена партии)
+          − возвраты покупателей, оприходованные на него
+
+        Отгрузки с буферов и с Ярмарки отдельно не берутся: их покрывает
+        нетто-перемещение, иначе была бы двойная запись. Приёмка сразу на
+        буфер тоже не попадает — основного склада она не касалась.
         """
         since, _ = period(days)
-        out: dict[str, float] = {}
+        sold: dict[str, float] = {}      # отгрузки + розница с основного
+        moved_out: dict[str, float] = {}  # перемещения с основного
+        moved_in: dict[str, float] = {}   # перемещения обратно на основной
+        returned: dict[str, float] = {}   # возвраты покупателей
         docs_total = 0
         inline = 0
+        skipped = 0
+
+        want = store_name.strip().lower()
 
         for path in ("/entity/demand", "/entity/retaildemand"):
             try:
@@ -225,6 +306,14 @@ class MS:
                                       "expand": "positions.assortment"},
                                      page=EXPAND_PAGE):
                     docs_total += 1
+                    if want:
+                        # считаем отток только с ОСНОВНОГО склада: именно его
+                        # наполняем. отгрузки с буферов и ярмарки — не наш расход
+                        sname = self._store_of(doc.get("store"))
+                        if sname != want:
+                            skipped += 1
+                            continue
+
                     pos = doc.get("positions")
                     rows = pos.get("rows") if isinstance(pos, dict) else None
                     if not isinstance(rows, list) or not rows:
@@ -236,12 +325,84 @@ class MS:
                             continue
                         q = float(p.get("quantity") or 0)
                         if q:
-                            out[aid] = out.get(aid, 0.0) + q
+                            sold[aid] = sold.get(aid, 0.0) + q
             except MoySkladError as e:
                 log.info("%s: %s", path, e)
 
-        log.info("Документов: %s, с позициями в ответе: %s", docs_total, inline)
-        log.info("Продажи: %s позиций, %s шт.", len(out), sum(out.values()))
+        # возвраты покупателей уменьшают расход: товар вернулся на склад.
+        # отгрузки на ФБО считаются оттоком, поэтому без вычета возвратов
+        # спрос оказался бы завышен на их объём.
+        try:
+            for doc in self.rows("/entity/salesreturn",
+                                 {"filter": f"moment>={since}",
+                                  "expand": "positions.assortment"},
+                                 page=EXPAND_PAGE):
+                if want and self._store_of(doc.get("store")) != want:
+                    continue
+                pos = doc.get("positions")
+                rows = pos.get("rows") if isinstance(pos, dict) else None
+                if not isinstance(rows, list):
+                    continue
+                for p in rows:
+                    aid = (p.get("assortment") or {}).get("id")
+                    if not aid:
+                        continue
+                    q = float(p.get("quantity") or 0)
+                    if q:
+                        returned[aid] = returned.get(aid, 0.0) + q
+        except MoySkladError as e:
+            log.info("/entity/salesreturn: %s", e)
+
+        # перемещения: ушли с основного — расход, пришли на основной — возврат расхода.
+        # Партия на буфер ФБО физически покидает склад, поэтому считается оттоком;
+        # обратное перемещение (товар не уехал) отток отменяет.
+        if want:
+            try:
+                for doc in self.rows("/entity/move",
+                                     {"filter": f"moment>={since}",
+                                      "expand": "positions.assortment"},
+                                     page=EXPAND_PAGE):
+                    src = self._store_of(doc.get("sourceStore"))
+                    dst = self._store_of(doc.get("targetStore"))
+                    sign = 1.0 if src == want else (-1.0 if dst == want else 0.0)
+                    if not sign:
+                        continue
+
+                    pos = doc.get("positions")
+                    rows = pos.get("rows") if isinstance(pos, dict) else None
+                    if not isinstance(rows, list):
+                        continue
+                    for p in rows:
+                        aid = (p.get("assortment") or {}).get("id")
+                        if not aid:
+                            continue
+                        q = float(p.get("quantity") or 0)
+                        if not q:
+                            continue
+                        if sign > 0:
+                            moved_out[aid] = moved_out.get(aid, 0.0) + q
+                        else:
+                            moved_in[aid] = moved_in.get(aid, 0.0) + q
+            except MoySkladError as e:
+                log.info("/entity/move: %s", e)
+
+        # Нетто-отток: продажи + ушло на буферы/Ярмарку − вернулось − возвраты.
+        # Одна формула на все позиции, минус обрезается внутри net_outflow().
+        from calc import net_outflow
+
+        out: dict[str, float] = {}
+        for aid in set(sold) | set(moved_out) | set(moved_in) | set(returned):
+            v = net_outflow(sold.get(aid, 0.0), moved_out.get(aid, 0.0),
+                            moved_in.get(aid, 0.0), returned.get(aid, 0.0))
+            if v > 0:
+                out[aid] = v
+
+        log.info("Документов: %s, с позициями в ответе: %s, не с основного склада: %s",
+                 docs_total, inline, skipped)
+        log.info("Расход: %s позиций, %s шт. (возвраты −%s шт., "
+                 "перемещения с основного +%s / на основной −%s шт.)",
+                 len(out), sum(out.values()), sum(returned.values()),
+                 sum(moved_out.values()), sum(moved_in.values()))
         return out
 
     # ---------------------------------------------------------- диагностика
@@ -256,7 +417,8 @@ class MS:
         except MoySkladError as e:
             report.append(("склады", f"ошибка: {e}"))
 
-        for path in ("/entity/demand", "/entity/retaildemand"):
+        for path in ("/entity/demand", "/entity/retaildemand",
+                     "/entity/salesreturn", "/entity/move"):
             try:
                 docs = list(self.rows(path,
                                       {"filter": f"moment>={since}",
@@ -349,6 +511,4 @@ def describe(p: dict) -> dict:
         "barcodes": _barcodes(p),
         "supplier_id": supplier_id,
         "buy_price": price,
-        "size": "",
-        "color": "",
     }
